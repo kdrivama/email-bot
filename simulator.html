@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Service Console Simulator</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-header">
+        <div class="app-brand"><span class="brand-icon"><i class="fas fa-cloud"></i></span><span class="brand-text">Service Console</span></div>
+    </div>
+    <div class="container">
+        <aside class="sidebar">
+            <div class="sidebar-section">
+                <div class="sidebar-title">SERVICE</div>
+                <ul>
+                    <li><a href="#"><i class="fas fa-inbox"></i><span>Email</span></a></li>
+                    <li><a href="#"><i class="fas fa-folder-open"></i><span>Cases</span></a></li>
+                    <li><a href="#"><i class="fas fa-users"></i><span>Contacts</span></a></li>
+                </ul>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-title">TOOLS</div>
+                <ul>
+                    <li><a href="#"><i class="fas fa-book"></i><span>Knowledge</span></a></li>
+                    <li><a href="#"><i class="fas fa-chart-bar"></i><span>Reports</span></a></li>
+                    <li><a href="#"><i class="fas fa-wrench"></i><span>Tools</span></a></li>
+                </ul>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <header>
+                <h1>Service Console</h1>
+            </header>
+
+            <section class="case-details">
+                <div class="case-row">
+                    <div class="status urgent">Urgent</div>
+                    <h2>ACCOUNT LOCKED</h2>
+                    <div class="timer" id="timer">3:30</div>
+                </div>
+                <div class="email-info">
+                    <p><strong>From:</strong> jamesc@email.com</p>
+                    <p><strong>To:</strong> support@kstore.com</p>
+                    <p><strong>Received:</strong> <span id="meta-received">[Timestamp]</span></p>
+                </div>
+            </section>
+
+            <section class="messages" id="messages">
+                <!-- Email thread will be appended here -->
+                <div class="email-item customer">
+                    <div class="email-header">
+                        <div class="email-from"><strong>James Carter</strong> <span class="email-address">&lt;jamesc@email.com&gt;</span></div>
+                        <div class="email-meta">Today • 3:30</div>
+                    </div>
+                    <div class="email-body">What the hell is wrong with your company?! My account is locked — I pressed "Forgot Password" and I never got the reset email. I need access NOW. This is ridiculous! Fix this immediately!</div>
+                </div>
+            </section>
+
+            <section class="reply-section">
+                <div class="editor-toolbar">
+                    <button type="button" title="Bold"><i class="fas fa-bold"></i></button>
+                    <button type="button" title="Italic"><i class="fas fa-italic"></i></button>
+                    <button type="button" title="Bulleted list"><i class="fas fa-list-ul"></i></button>
+                    <button type="button" title="Link"><i class="fas fa-link"></i></button>
+                </div>
+                <textarea id="agent-reply" placeholder="Type your reply here..."></textarea>
+                <div class="button-group">
+                    <div class="button-left">
+                        <button id="close-case" class="secondary">Close Case</button>
+                    </div>
+                    <div class="button-right">
+                        <button id="send-button" class="primary">Send</button>
+                    </div>
+                </div>
+            </section>
+
+            <div class="notice-popup escalation-popup" id="escalation-popup">
+                <h3>Escalation Confirmation</h3>
+                <p>Does this case need escalation?</p>
+                <label><input type="radio" id="escalation-no" name="escalation" value="No" checked> No</label>
+                <label><input type="radio" id="escalation-yes" name="escalation" value="Yes"> Yes</label>
+                <div class="escalation-actions" style="margin-top:10px; display:flex; gap:10px; justify-content:flex-end;">
+                    <button id="submit-escalation">Submit</button>
+                </div>
+            </div>
+
+            <div class="notice-popup" id="termination-popup" style="display: none;">
+                <h3>Conversation Ended</h3>
+                <p id="termination-message">The conversation has been terminated due to unprofessional or unhelpful responses. Proceed to evaluation.</p>
+                <div class="button-group" style="text-align: right; margin-top: 10px;">
+                    <button id="termination-ok">Ok</button>
+                </div>
+            </div>
+
+            <div class="notice-popup" id="loading-popup" style="display: none;">
+                <h3>Evaluating Interaction</h3>
+                <p>Please wait while we evaluate this interaction...</p>
+            </div>
+
+            <!-- Escalation Details Popup (visible only if user chooses Yes) -->
+            <div class="notice-popup" id="escalation-details" style="display:none;">
+                <h3>Escalation Details</h3>
+                <div style="margin-top:8px; display:flex; flex-direction:column; gap:10px;">
+                    <label>Email
+                        <input type="email" id="esc-email" value="jamesc@email.com" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:4px;"/>
+                    </label>
+                    <label>Phone
+                        <input type="text" id="esc-phone" value="+1 (555) 789-0123" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:4px;"/>
+                    </label>
+                    <label>Route to
+                        <select id="esc-route" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:4px;">
+                            <option value="swat">Route to SWAT team</option>
+                            <option value="tier3">Route to Inhouse Team Tier 3</option>
+                            <option value="tier2">Route to T2 (vendor team leader)</option>
+                        </select>
+                    </label>
+                </div>
+                <div style="margin-top:12px; display:flex; justify-content:space-between; align-items:center; gap:10px;">
+                    <button id="esc-back" class="secondary">Back</button>
+                    <button id="esc-submit" class="primary">Submit</button>
+                </div>
+            </div>
+
+            <div class="feedback-slide" id="feedback-slide">
+                <!-- Feedback will be inserted here -->
+            </div>
+        </main>
+        <aside class="evaluation-panel hidden" id="evaluation-panel">
+            <h2>Interaction Evaluation</h2>
+            <div class="total-box">
+                <div class="total-label">Total Score</div>
+                <div class="total-value" id="total-score">0/100</div>
+            </div>
+            <div class="deduction-box hidden" id="deduction-box">
+                <div class="deduction-title">Deductions</div>
+                <div class="deduction-value" id="deduction-total">-0</div>
+                <ul class="deduction-list" id="deduction-list"></ul>
+            </div>
+            <div class="eval-grid">
+                <div class="eval-card">
+                    <div class="eval-title">Greeting</div>
+                    <div class="eval-score" id="score-greeting">0/25</div>
+                    <div class="eval-desc" id="desc-greeting"></div>
+                </div>
+                <div class="eval-card">
+                    <div class="eval-title">Empathy</div>
+                    <div class="eval-score" id="score-empathy">0/25</div>
+                    <div class="eval-desc" id="desc-empathy"></div>
+                </div>
+                <div class="eval-card">
+                    <div class="eval-title">Solution</div>
+                    <div class="eval-score" id="score-solution">0/25</div>
+                    <div class="eval-desc" id="desc-solution"></div>
+                </div>
+                <div class="eval-card">
+                    <div class="eval-title">Closing</div>
+                    <div class="eval-score" id="score-closing">0/25</div>
+                    <div class="eval-desc" id="desc-closing"></div>
+                </div>
+            </div>
+            <div class="overall-feedback">
+                <div class="overall-title">Overall Feedback</div>
+                <p id="overall-feedback">Run the conversation and close the case to see evaluation here.</p>
+            </div>
+            <div class="detail-actions">
+                <button id="see-details" class="primary" style="width:100%">See detailed feedback</button>
+            </div>
+        </aside>
+        
+        <!-- Detailed Feedback Slide -->
+        <div class="detail-slide hidden" id="detail-slide">
+            <div class="detail-header">
+                <h3>Detailed Feedback</h3>
+                <button id="detail-close" title="Close">✕</button>
+            </div>
+            <div class="detail-content">
+                <div class="detail-section" id="detail-deductions-section" style="display:none;">
+                    <div class="detail-title">Deductions</div>
+                    <div class="detail-why" id="detail-deductions-summary"></div>
+                    <ul id="detail-deductions-list"></ul>
+                    <div class="detail-perfect" id="detail-deductions-prevent"></div>
+                </div>
+                <div class="detail-section">
+                    <div class="detail-title">Greeting</div>
+                    <div class="detail-score" id="detail-greeting-score">0/25</div>
+                    <div class="detail-why" id="detail-greeting-why"></div>
+                    <div class="detail-perfect" id="detail-greeting-perfect"></div>
+                    <pre class="detail-example" id="detail-greeting-example"></pre>
+                </div>
+                <div class="detail-section">
+                    <div class="detail-title">Empathy</div>
+                    <div class="detail-score" id="detail-empathy-score">0/25</div>
+                    <div class="detail-why" id="detail-empathy-why"></div>
+                    <div class="detail-perfect" id="detail-empathy-perfect"></div>
+                    <pre class="detail-example" id="detail-empathy-example"></pre>
+                </div>
+                <div class="detail-section">
+                    <div class="detail-title">Solution</div>
+                    <div class="detail-score" id="detail-solution-score">0/25</div>
+                    <div class="detail-why" id="detail-solution-why"></div>
+                    <div class="detail-perfect" id="detail-solution-perfect"></div>
+                    <pre class="detail-example" id="detail-solution-example"></pre>
+                </div>
+                <div class="detail-section">
+                    <div class="detail-title">Closing</div>
+                    <div class="detail-score" id="detail-closing-score">0/25</div>
+                    <div class="detail-why" id="detail-closing-why"></div>
+                    <div class="detail-perfect" id="detail-closing-perfect"></div>
+                    <pre class="detail-example" id="detail-closing-example"></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="simulator.js"></script>
+</body>
+</html>
