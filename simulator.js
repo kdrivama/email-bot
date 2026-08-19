@@ -300,6 +300,20 @@ document.addEventListener('DOMContentLoaded', () => {
     get('total-score').textContent = `${totalVal}/100`;
     get('overall-feedback').textContent = data.feedback || '';
 
+    // Both AI providers were unavailable, so this score came from keyword matching
+    // rather than AI judgment — the trainee can still finish the exercise, but the
+    // score is a rougher estimate and must never look identical to a real one.
+    const fallbackBox = get('fallback-mode-box');
+    if (fallbackBox) {
+      if (data.evaluationMode === 'scripted') {
+        fallbackBox.textContent = 'AI evaluation was unavailable — this score was calculated by keyword matching instead, as a fallback so you could still finish. It may be less accurate than a normal evaluation, particularly for empathy and tone.';
+        fallbackBox.classList.remove('hidden');
+      } else {
+        fallbackBox.classList.add('hidden');
+        fallbackBox.textContent = '';
+      }
+    }
+
     // The server can zero every score for a critical violation (profanity, hostile
     // or dismissive language); without this the trainee saw a 0/100 with no
     // indication of why, indistinguishable from an ordinary weak reply.

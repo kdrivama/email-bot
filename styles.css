@@ -326,6 +326,10 @@ header h1 {
 /* Critical violation banner */
 .violation-box { background:#b00020; color:#fff; border-radius:8px; padding:12px; margin: 8px 0 16px 0; font-weight:600; }
 .violation-box.hidden { display:none; }
+
+/* Scripted-fallback-evaluation banner (AI unavailable) */
+.fallback-mode-box { background:#fff8e1; color:#7a5c00; border:1px solid #f0d98c; border-radius:8px; padding:12px; margin: 8px 0 16px 0; font-weight:600; font-size: 0.9em; }
+.fallback-mode-box.hidden { display:none; }
 /* remove bullets from deduction lists */
 .deduction-list,
 #detail-deductions-list {

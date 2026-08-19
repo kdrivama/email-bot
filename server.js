@@ -330,6 +330,106 @@ async function processApiResponse(content) {
   return validated;
 }
 
+// --- Deterministic fallback evaluator ---
+// /api/respond degrades gracefully when both providers fail (see the canned lines
+// below), so a conversation can always be completed without AI. Evaluation had no
+// equivalent — a trainee who finished the conversation while both providers were
+// down hit a dead end with no way to see a score. This scores the same 4x25 rubric
+// with regex, reusing the exact solutionProvided/closingPattern checks /api/respond
+// already applies live, so the two paths agree on what counts as a solution or a
+// close. It is intentionally cruder than the AI's judgment — it exists to finish
+// the exercise, not to replace real grading, and is always labeled as a fallback.
+const SCRIPTED_GREETING = {
+  greetingWord: /\b(hello|hi|good\s?(morning|afternoon|evening)|dear)\b/i,
+  customerName: /\b(james|carter|mr\.?\s*carter)\b/i,
+  offerToHelp: /\b(help|assist|here (for|to help)|resolve|sort (this|it) out)\b/i
+};
+const SCRIPTED_EMPATHY = {
+  acknowledge: /\b(frustrat\w*|upset\w*|inconvenien\w*|understand how (you feel|frustrating))\b/i,
+  understanding: /\b(i understand|i (can |)appreciate|i realize|i recognize)\b/i,
+  supportive: /\b(i('m| am) here to help|right away|let's get this (sorted|resolved)|i('ll| will) help)\b/i
+};
+// Same pattern /api/respond uses live to decide whether a reply counts as the
+// solution — keeping evaluation and conversation-flow judgment consistent.
+const SCRIPTED_SOLUTION_ACTION = /(triggered|sent|resent|initiated|generated|issued|created|started).{0,50}password reset|password reset.{0,50}(email|link)|reset email|reset password link|manual unlock/i;
+const SCRIPTED_SOLUTION_VERIFY = /\b(check your (inbox|email|spam)|spam( |-)?(folder|junk)|verify|confirm)\b/i;
+const SCRIPTED_SOLUTION_OUTCOME = /\b(within|expire|expires|expiry|1 hour|5 minutes|\d+\s?(minutes|hours))\b/i;
+// Same closing pattern /api/respond checks live.
+const SCRIPTED_CLOSING_PATTERN = /(thank(?:s| you)|appreciate).*(contact|reach|time)|have (?:a )?(good|great|nice) (day|evening)|feel free to reach out|let me know if|anything else i can help/i;
+const SCRIPTED_CLOSING_OFFER = /\b(anything else|further (assistance|help)|other (issues|questions))\b/i;
+const SCRIPTED_CLOSING_THANKS = /\b(thank(?:s| you)|appreciate)\b/i;
+
+function scriptedEvaluate(messages) {
+  const agentMessages = messages.filter(m => m.role === 'agent').map(m => m.content);
+  const allAgentText = agentMessages.join(' ');
+  const firstAgentMsg = agentMessages[0] || '';
+  const lastAgentMsg = agentMessages[agentMessages.length - 1] || '';
+
+  // Critical violations checked across every agent message, same word lists the AI
+  // prompt is given.
+  let criticalViolation = false;
+  let violationDetails = '';
+  outer: for (const [category, words] of Object.entries(evaluationConfig.violations)) {
+    for (const word of words) {
+      if (new RegExp(`\\b${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(allAgentText)) {
+        criticalViolation = true;
+        violationDetails = `Agent used a "${category}" word or phrase ("${word}") — automatic zero applied.`;
+        break outer;
+      }
+    }
+  }
+
+  const score = (checks, weights) => {
+    let s = 0;
+    let anyPresent = false;
+    checks.forEach((matched, i) => { if (matched) { s += weights[i]; anyPresent = true; } });
+    return { score: Math.min(25, s), present: anyPresent };
+  };
+
+  const elements = {};
+  if (criticalViolation) {
+    for (const category of Object.keys(evaluationConfig.criteria)) {
+      elements[category] = { present: false, score: 0, feedback: 'Zero applied due to critical violation.' };
+    }
+  } else {
+    const g = score(
+      [SCRIPTED_GREETING.greetingWord.test(firstAgentMsg), SCRIPTED_GREETING.customerName.test(firstAgentMsg), SCRIPTED_GREETING.offerToHelp.test(firstAgentMsg)],
+      [9, 8, 8]
+    );
+    elements.greeting = { present: g.present, score: g.score, feedback: g.present ? 'Detected via keyword match on the first reply (scripted fallback — not AI-judged).' : 'No greeting phrase, customer name, or offer to help detected in the first reply.' };
+
+    const e = score(
+      [SCRIPTED_EMPATHY.acknowledge.test(allAgentText), SCRIPTED_EMPATHY.understanding.test(allAgentText), SCRIPTED_EMPATHY.supportive.test(allAgentText)],
+      [9, 8, 8]
+    );
+    elements.empathy = { present: e.present, score: e.score, feedback: e.present ? 'Detected via keyword match (scripted fallback — not AI-judged).' : 'No empathy or supportive language detected.' };
+
+    const s = score(
+      [SCRIPTED_SOLUTION_ACTION.test(allAgentText), SCRIPTED_SOLUTION_VERIFY.test(allAgentText), SCRIPTED_SOLUTION_OUTCOME.test(allAgentText)],
+      [12, 7, 6]
+    );
+    elements.solution = { present: s.present, score: s.score, feedback: s.present ? 'Detected a password-reset action and/or verification/timing language (scripted fallback — not AI-judged).' : 'No password reset action, verification step, or timing detected.' };
+
+    const c = score(
+      [SCRIPTED_CLOSING_PATTERN.test(lastAgentMsg), SCRIPTED_CLOSING_OFFER.test(lastAgentMsg), SCRIPTED_CLOSING_THANKS.test(lastAgentMsg)],
+      [10, 8, 7]
+    );
+    elements.closing = { present: c.present, score: c.score, feedback: c.present ? 'Detected a closing phrase in the final reply (scripted fallback — not AI-judged).' : 'No closing phrase, offer of further help, or thanks detected in the final reply.' };
+  }
+
+  const totalScore = Object.values(elements).reduce((sum, el) => sum + el.score, 0);
+
+  return {
+    elements,
+    totalScore,
+    feedback: criticalViolation
+      ? `Scripted evaluation (AI unavailable): ${violationDetails}`
+      : 'Scripted evaluation (AI unavailable) — scored by keyword matching against the same rubric. This is a fallback, not a substitute for AI judgment; results may be less accurate, particularly for empathy and tone.',
+    criticalViolation,
+    violationDetails
+  };
+}
+
 // Endpoint: Evaluate conversation
 app.post('/api/evaluate', async (req, res) => {
   try {
@@ -357,17 +457,27 @@ app.post('/api/evaluate', async (req, res) => {
       ? await callAI(evaluationMessages, { maxTokens: 1000, temperature: 0.3, jsonMode: true })
       : null;
 
-    if (!result) {
-      // Distinguishable from a genuine 0/100: the client shows this as a system
-      // failure with a retry option, not as a scored (and gradable) performance.
-      return res.status(503).json({
-        error: 'Evaluation unavailable',
-        details: 'The evaluation service could not be reached. This is a system issue, not your score — please try again.',
-        evaluationFailed: true
-      });
+    let evaluation;
+    let evaluationMode;
+    if (result) {
+      try {
+        evaluation = await processApiResponse(result.content);
+        evaluationMode = 'ai';
+      } catch (parseError) {
+        // The model returned something unparseable — same recovery as no result at
+        // all, rather than surfacing a raw parse error to the trainee.
+        evaluation = scriptedEvaluate(messages);
+        evaluationMode = 'scripted';
+      }
+    } else {
+      // Both providers exhausted. Previously this was a 503 dead end: a trainee
+      // could finish the whole conversation and then be unable to see a score
+      // until a key was topped up. Score deterministically instead, clearly
+      // labeled, so the exercise can always be completed.
+      evaluation = scriptedEvaluate(messages);
+      evaluationMode = 'scripted';
     }
-
-    const evaluation = await processApiResponse(result.content);
+    evaluation.evaluationMode = evaluationMode;
 
     // Compute penalties deterministically from request data
     const latePenaltyPer = evaluationConfig.penalties?.lateReply?.deductionPerInstance || 0;
