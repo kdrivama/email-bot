@@ -1,6 +1,7 @@
-// server.js (Refactored: Added new endpoints/logic for timing/escalation, updated evaluation to include penalties, cleaned up code structure, ensured compatibility)
+// server.js
 const express = require('express');
 const fetch = require('node-fetch');
+const crypto = require('crypto');
 require('dotenv').config();
 const rateLimit = require('express-rate-limit');
 const bodyParser = require('body-parser');
@@ -12,14 +13,35 @@ const evaluationConfig = require('./config/evaluationCriteria');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Render (and most hosts) terminate TLS at their own proxy, so without this req.ip
+// is the proxy's address — the same value for every visitor. That breaks both the
+// per-IP rate limit below (one global bucket instead of one per visitor) and
+// express-session's "secure" cookie auto-detection.
+//
+// Trust exactly one hop, not `true` (all hops). `true` accepts a client-supplied
+// X-Forwarded-For at face value, which lets a visitor with no real proxy in front
+// simply set that header themselves and spoof req.ip — defeating the rate limiter
+// it's meant to protect. Render sits exactly one hop in front, so `1` trusts only
+// the address Render itself reports and ignores anything the client tries to add.
+app.set('trust proxy', 1);
+
 // Middleware setup
 app.use(rateLimit({ windowMs: 60 * 1000, max: 30 }));
 app.use(bodyParser.json());
+
+// A hardcoded, published secret defeats the point of signing session cookies. If
+// SESSION_SECRET isn't set, generate one at boot rather than falling back to a
+// public string — sessions just don't survive a restart, which is fine for a
+// stateless practice tool.
+const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+if (!process.env.SESSION_SECRET) {
+  console.warn('SESSION_SECRET not set — using a random value generated at boot. Sessions will not survive a restart. Set SESSION_SECRET in production to avoid this.');
+}
 app.use(session({
-  secret: 'your-secret-key',
+  secret: sessionSecret,
   resave: false,
   saveUninitialized: true,
-  cookie: { secure: false }
+  cookie: { secure: 'auto' } // relies on trust proxy above to detect HTTPS correctly
 }));
 app.use(express.static(path.join(__dirname)));
 
@@ -28,9 +50,199 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'simulator.html'));
 });
 
-const cache = new Map();
+// --- AI provider configuration ---
+// Both providers speak the OpenAI chat-completions shape, so only the base URL, the
+// key and the model names differ.
+const PROVIDERS = {
+  deepseek: {
+    baseUrl: 'https://api.deepseek.com/v1',
+    keyEnv: 'DEEPSEEK_API_KEY',
+    // deepseek-chat, not deepseek-reasoner — this only needs a customer reply or a
+    // JSON evaluation, not visible reasoning tokens spent getting there.
+    defaultModels: ['deepseek-chat']
+  },
+  openrouter: {
+    baseUrl: 'https://openrouter.ai/api/v1',
+    keyEnv: 'OPENROUTER_API_KEY',
+    // Free OpenRouter slugs are retired without notice — the model this project
+    // originally hardcoded (mistralai/mistral-7b-instruct) no longer exists on the
+    // platform at all, in any variant, which is why this list is deliberately
+    // re-verified rather than assumed. Check https://openrouter.ai/models before
+    // trusting any slug here long-term.
+    defaultModels: ['google/gemma-4-26b-a4b-it:free', 'poolside/laguna-s-2.1:free', 'openai/gpt-oss-20b:free']
+  }
+};
 
-// Updated scoring prompt to include penalties from config
+const REQUESTED_PROVIDER = process.env.AI_PROVIDER
+  || (process.env.DEEPSEEK_API_KEY ? 'deepseek' : 'openrouter');
+
+// If the requested provider has no key but the other one does, use that instead —
+// a half-applied config (provider switched, key not yet added) should degrade to
+// what still works rather than disabling AI entirely.
+function resolveProvider(name) {
+  if (PROVIDERS[name] && process.env[PROVIDERS[name].keyEnv]) return name;
+  for (const [candidate, config] of Object.entries(PROVIDERS)) {
+    if (process.env[config.keyEnv]) return candidate;
+  }
+  return PROVIDERS[name] ? name : 'openrouter';
+}
+
+const AI_PROVIDER = resolveProvider(REQUESTED_PROVIDER);
+
+function modelsFor(providerName) {
+  if (process.env.AI_MODELS) {
+    const explicit = process.env.AI_MODELS.split(',').map(s => s.trim()).filter(Boolean);
+    // Route each entry to the provider it belongs to. OpenRouter slugs always
+    // contain a "/"; DeepSeek names never do. A stale list from one provider must
+    // not get sent to an API that has never heard of those names.
+    const routed = explicit.filter(m => (m.includes('/') ? 'openrouter' : 'deepseek') === providerName);
+    if (routed.length) return routed;
+  }
+  return PROVIDERS[providerName].defaultModels;
+}
+
+// Primary provider's models first, then any other configured provider's — so a
+// DeepSeek outage or empty balance falls through to OpenRouter's free models
+// instead of breaking the simulator for every visitor.
+const AI_CHAIN = [];
+for (const name of [AI_PROVIDER, ...Object.keys(PROVIDERS).filter(n => n !== AI_PROVIDER)]) {
+  if (!process.env[PROVIDERS[name].keyEnv]) continue;
+  for (const model of modelsFor(name)) AI_CHAIN.push({ provider: name, model });
+}
+
+const AI_ENABLED = AI_CHAIN.length > 0;
+const AI_TOTAL_BUDGET_MS = Number(process.env.AI_TOTAL_BUDGET_MS || 25000);
+const AI_PER_CALL_TIMEOUT_MS = 15000;
+
+// Per provider, set when it reports an account-wide quota is spent (OpenRouter's
+// free tier is 50 requests/day for the whole account, not per model). Until it
+// passes, that provider is skipped — the chain still tries any other provider.
+const aiCooldownUntil = new Map();
+
+function readDailyQuotaReset(body) {
+  const error = body && body.error;
+  if (!error) return 0;
+  const isDaily = error.metadata && error.metadata.limit_source === 'openrouter_free_tier_daily';
+  const mentionsDaily = typeof error.message === 'string' && error.message.includes('free-models-per-day');
+  if (!isDaily && !mentionsDaily) return 0;
+  const reset = Number(error.metadata && error.metadata.headers && error.metadata.headers['X-RateLimit-Reset']);
+  if (!Number.isFinite(reset) || reset <= Date.now()) return Date.now() + 60 * 60 * 1000;
+  return reset;
+}
+
+function callChatCompletion(messages, { model, maxTokens, temperature, jsonMode, provider }) {
+  const name = provider;
+  const cfg = PROVIDERS[name];
+  const headers = {
+    'Authorization': `Bearer ${process.env[cfg.keyEnv]}`,
+    'Content-Type': 'application/json'
+  };
+  if (name === 'openrouter') {
+    headers['HTTP-Referer'] = process.env.HTTP_REFERER || 'http://localhost:5000';
+    headers['X-Title'] = 'K Store Email Simulator';
+  }
+  const body = {
+    model,
+    messages,
+    temperature: typeof temperature === 'number' ? temperature : 0.7,
+    max_tokens: maxTokens
+  };
+  if (jsonMode) body.response_format = { type: 'json_object' };
+
+  return fetch(`${cfg.baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    timeout: AI_PER_CALL_TIMEOUT_MS
+  }).then(async r => ({ status: r.status, data: await r.json().catch(() => ({})) }));
+}
+
+// Tries each model in the chain in order until one returns usable content. Used by
+// both /api/respond and /api/evaluate, so a transient failure or a spent daily
+// quota on one provider falls through to the next rather than failing the request.
+async function callAI(messages, { maxTokens = 400, temperature = 0.7, jsonMode = false } = {}) {
+  const deadline = Date.now() + AI_TOTAL_BUDGET_MS;
+
+  for (const { provider, model } of AI_CHAIN) {
+    if (Date.now() >= deadline) break;
+    if (Date.now() < (aiCooldownUntil.get(provider) || 0)) continue;
+
+    try {
+      const response = await callChatCompletion(messages, { model, maxTokens, temperature, jsonMode, provider });
+
+      if (response.status === 429) {
+        const reset = readDailyQuotaReset(response.data);
+        if (reset) aiCooldownUntil.set(provider, reset);
+        continue;
+      }
+      // A bad or unfunded key fails identically on every model in that provider.
+      if (response.status === 401 || response.status === 402 || response.status === 403) {
+        aiCooldownUntil.set(provider, Date.now() + 10 * 60 * 1000);
+        continue;
+      }
+      if (response.status !== 200) continue;
+
+      const content = response.data?.choices?.[0]?.message?.content;
+      if (!content || !content.trim()) continue;
+
+      return { content, provider, model };
+    } catch (error) {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+// --- Per-visitor AI budget ---
+// This page can be embedded publicly, and /api/evaluate calls a paid model on every
+// use. Cap AI-backed turns per IP per hour; past the cap the request still gets a
+// clear error rather than an unbounded bill. Meaningful now that trust proxy above
+// makes req.ip the real visitor address instead of one shared proxy IP.
+const AI_RATE_LIMIT_PER_HOUR = Number(process.env.AI_RATE_LIMIT_PER_HOUR || 40);
+const aiUsage = new Map();
+
+function consumeAiBudget(req) {
+  const key = req.ip || 'unknown';
+  const now = Date.now();
+  const windowMs = 60 * 60 * 1000;
+  const entry = aiUsage.get(key);
+  if (!entry || now - entry.windowStart >= windowMs) {
+    aiUsage.set(key, { windowStart: now, count: 1 });
+    return true;
+  }
+  if (entry.count >= AI_RATE_LIMIT_PER_HOUR) return false;
+  entry.count++;
+  return true;
+}
+
+// --- Housekeeping: bounded reply cache ---
+// A cache with no eviction grows forever on a long-running instance. Cap entry
+// count and drop the oldest when full — simple LRU-ish behaviour via Map's
+// insertion-order iteration.
+const CACHE_MAX_ENTRIES = 500;
+const cache = new Map();
+function cacheSet(key, value) {
+  if (cache.size >= CACHE_MAX_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    cache.delete(oldest);
+  }
+  cache.set(key, value);
+}
+
+// Periodic cleanup of expired rate-limit windows and session-scoped counters.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of aiUsage) {
+    if (now - entry.windowStart >= 60 * 60 * 1000) aiUsage.delete(key);
+  }
+}, 15 * 60 * 1000).unref();
+
+// Updated scoring prompt to include penalties and violation word lists from config
+const CRITICAL_VIOLATION_WORDS = Object.entries(evaluationConfig.violations)
+  .map(([category, words]) => `${category}: ${words.join(', ')}`)
+  .join('\n');
+
 const SCORING_PROMPT = `
 You are a Customer Service Quality Analyzer. Evaluate this conversation using these EXACT criteria:
 
@@ -44,6 +256,11 @@ ${evaluationConfig.examples.good.map(ex => `${ex.type}: ${ex.text}`).join('\n')}
 
 BAD EXAMPLES:
 ${evaluationConfig.examples.bad.map(ex => `${ex.type}: ${ex.text}`).join('\n')}
+
+CRITICAL VIOLATIONS — if the agent's reply contains language matching any of these
+categories, set criticalViolation to true, describe it in violationDetails, and set
+every element's score to 0 regardless of anything else in the conversation:
+${CRITICAL_VIOLATION_WORDS}
 
 IMPORTANT: Return ONLY valid JSON in this format:
 {
@@ -63,33 +280,6 @@ IMPORTANT: Return ONLY valid JSON in this format:
   "violationDetails": ""
 }`;
 
-// Helper: Wait function
-const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-// Helper: API request with retries
-async function makeApiRequest(url, requestBody, maxRetries = 3) {
-  let lastError;
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(requestBody)
-      });
-      if (!response.ok) throw new Error(`API failed: ${response.status}`);
-      return await response.json();
-    } catch (error) {
-      console.error(`Attempt ${i + 1} failed:`, error);
-      lastError = error;
-      if (i < maxRetries - 1) await wait(1000 * Math.pow(2, i));
-    }
-  }
-  throw lastError;
-}
-
 // Helper: Validate message
 function validateMessage(message) {
   return message && typeof message === 'object' && typeof message.content === 'string' &&
@@ -107,15 +297,13 @@ function formatMessagesForEvaluation(messages) {
 }
 
 // Helper: Process API evaluation response
-async function processApiResponse(result) {
-  if (!result?.choices?.[0]?.message?.content) throw new Error('Invalid API response');
-  const responseContent = result.choices[0].message.content.trim();
+async function processApiResponse(content) {
+  const responseContent = content.trim();
   const jsonMatch = responseContent.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error('No JSON in response');
   const cleanJson = jsonMatch[0].replace(/,\s*([\]}])/g, '$1');
   const evaluation = JSON.parse(cleanJson);
 
-  // Validate and format
   const validated = {
     elements: {},
     penalties: evaluation.penalties || { lateReplies: {count: 0, pointsDeducted: 0, feedback: ''}, wrongEscalation: {applied: false, pointsDeducted: 0, feedback: ''} },
@@ -127,9 +315,13 @@ async function processApiResponse(result) {
 
   for (const category of Object.keys(evaluationConfig.criteria)) {
     const element = evaluation.elements?.[category] || {};
+    // A critical violation zeroes every element regardless of what the model scored
+    // each one individually — the deterministic override backing the prompt's
+    // instruction, since a model asked to self-enforce a rule sometimes forgets to.
+    const rawScore = validated.criticalViolation ? 0 : Number(element.score) || 0;
     validated.elements[category] = {
-      present: Boolean(element.present),
-      score: Math.min(25, Math.max(0, Number(element.score) || 0)),
+      present: validated.criticalViolation ? false : Boolean(element.present),
+      score: Math.min(25, Math.max(0, rawScore)),
       feedback: String(element.feedback || '')
     };
     validated.totalScore += validated.elements[category].score;
@@ -137,6 +329,98 @@ async function processApiResponse(result) {
 
   return validated;
 }
+
+// Endpoint: Evaluate conversation
+app.post('/api/evaluate', async (req, res) => {
+  try {
+    const { messages, late_replies_count = 0, escalation_choice = 'No' } = req.body;
+    if (!messages || !Array.isArray(messages)) throw new Error('Valid messages array required');
+
+    if (!consumeAiBudget(req)) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        details: `Limit of ${AI_RATE_LIMIT_PER_HOUR} AI-backed requests per hour reached. Please try again later.`,
+        evaluationFailed: true
+      });
+    }
+
+    const formattedConversation = formatMessagesForEvaluation(messages);
+    const evaluationMessages = [
+      { role: 'system', content: SCORING_PROMPT },
+      {
+        role: 'user',
+        content: `Evaluate this interaction:\n\n${formattedConversation}\n\nLate replies count: ${late_replies_count}\nEscalation choice: ${escalation_choice} (correct is 'No')\nProvide detailed evaluation of agent's performance across all messages.`
+      }
+    ];
+
+    const result = AI_ENABLED
+      ? await callAI(evaluationMessages, { maxTokens: 1000, temperature: 0.3, jsonMode: true })
+      : null;
+
+    if (!result) {
+      // Distinguishable from a genuine 0/100: the client shows this as a system
+      // failure with a retry option, not as a scored (and gradable) performance.
+      return res.status(503).json({
+        error: 'Evaluation unavailable',
+        details: 'The evaluation service could not be reached. This is a system issue, not your score — please try again.',
+        evaluationFailed: true
+      });
+    }
+
+    const evaluation = await processApiResponse(result.content);
+
+    // Compute penalties deterministically from request data
+    const latePenaltyPer = evaluationConfig.penalties?.lateReply?.deductionPerInstance || 0;
+    const wrongEscalationPenalty = evaluationConfig.penalties?.wrongPopup?.deduction || 0;
+    const latePenaltyTotal = Number(late_replies_count || 0) * latePenaltyPer;
+    const wrongApplied = String(escalation_choice).toLowerCase() === 'yes';
+    const wrongPenaltyTotal = wrongApplied ? wrongEscalationPenalty : 0;
+
+    evaluation.penalties = {
+      lateReplies: {
+        count: Number(late_replies_count || 0),
+        pointsDeducted: latePenaltyTotal,
+        feedback: latePenaltyTotal > 0 ? `Deducted ${latePenaltyTotal} for ${late_replies_count} late replies` : ''
+      },
+      wrongEscalation: {
+        applied: wrongApplied,
+        pointsDeducted: wrongPenaltyTotal,
+        feedback: wrongApplied ? 'Escalation selected when not required in this scenario' : ''
+      }
+    };
+
+    const agentReplyCount = messages.filter(m => m.role === 'agent').length;
+    const exceededMaxReplies = agentReplyCount > 10;
+
+    if (exceededMaxReplies) {
+      evaluation.adjustedTotalScore = evaluation.totalScore - 90;
+      evaluation.feedback = (evaluation.feedback || '') + ' Penalty applied for excessive agent replies (limit 10).';
+    } else {
+      evaluation.adjustedTotalScore = evaluation.totalScore - latePenaltyTotal - wrongPenaltyTotal;
+    }
+
+    evaluation.context = {
+      messageCount: messages.length,
+      agentMessages: messages.filter(m => m.role === 'agent').length,
+      customerMessages: messages.filter(m => m.role === 'customer').length,
+      lateReplies: late_replies_count,
+      escalationChoice: escalation_choice
+    };
+
+    return res.json(evaluation);
+  } catch (error) {
+    console.error('Evaluation error:', error);
+    return res.status(500).json({
+      error: 'Evaluation failed',
+      details: error.message,
+      evaluationFailed: true,
+      elements: Object.fromEntries(Object.keys(evaluationConfig.criteria).map(cat => [cat, { present: false, score: 0, feedback: 'Evaluation failed' }])),
+      penalties: { lateReplies: {count: 0, pointsDeducted: 0, feedback: ''}, wrongEscalation: {applied: false, pointsDeducted: 0, feedback: ''} },
+      totalScore: 0,
+      feedback: 'Evaluation system error. Try again.'
+    });
+  }
+});
 
 // Helper: Validate customer response tone
 function validateCustomerResponse(text) {
@@ -166,92 +450,23 @@ function validateCustomerResponse(text) {
   return customerPatterns.some(p => p.test(text));
 }
 
-// Endpoint: Evaluate conversation (Updated to accept late_replies_count and escalation_choice)
-app.post('/api/evaluate', async (req, res) => {
-  try {
-    const { messages, late_replies_count = 0, escalation_choice = 'No' } = req.body;
-    if (!messages || !Array.isArray(messages)) throw new Error('Valid messages array required');
-
-    const formattedConversation = formatMessagesForEvaluation(messages);
-    const evaluationMessages = [
-      { role: 'system', content: SCORING_PROMPT },
-      {
-        role: 'user',
-        content: `Evaluate this interaction:\n\n${formattedConversation}\n\nLate replies count: ${late_replies_count}\nEscalation choice: ${escalation_choice} (correct is 'No')\nProvide detailed evaluation of agent's performance across all messages.`
-      }
-    ];
-
-    const result = await makeApiRequest('https://openrouter.ai/api/v1/chat/completions', {
-      model: 'openai/gpt-3.5-turbo',
-      messages: evaluationMessages,
-      temperature: 0.3,
-      max_tokens: 1000
-    });
-
-    const evaluation = await processApiResponse(result);
-
-    // Compute penalties deterministically from request data
-    const latePenaltyPer = evaluationConfig.penalties?.lateReply?.deductionPerInstance || 0;
-    const wrongEscalationPenalty = evaluationConfig.penalties?.wrongPopup?.deduction || 0;
-    const latePenaltyTotal = Number(late_replies_count || 0) * latePenaltyPer;
-    const wrongApplied = String(escalation_choice).toLowerCase() === 'yes';
-    const wrongPenaltyTotal = wrongApplied ? wrongEscalationPenalty : 0;
-
-    evaluation.penalties = {
-      lateReplies: {
-        count: Number(late_replies_count || 0),
-        pointsDeducted: latePenaltyTotal,
-        feedback: latePenaltyTotal > 0 ? `Deducted ${latePenaltyTotal} for ${late_replies_count} late replies` : ''
-      },
-      wrongEscalation: {
-        applied: wrongApplied,
-        pointsDeducted: wrongPenaltyTotal,
-        feedback: wrongApplied ? 'Escalation selected when not required in this scenario' : ''
-      }
-    };
-
-    // Determine if max replies exceeded and enforce formula (total score - 90)
-    const agentReplyCount = messages.filter(m => m.role === 'agent').length;
-    const exceededMaxReplies = agentReplyCount > 10;
-
-    // Provide adjusted total explicitly
-    if (exceededMaxReplies) {
-      evaluation.adjustedTotalScore = evaluation.totalScore - 90;
-      evaluation.feedback = (evaluation.feedback || '') + ' Penalty applied for excessive agent replies (limit 10).';
-    } else {
-      evaluation.adjustedTotalScore = evaluation.totalScore - latePenaltyTotal - wrongPenaltyTotal;
-    }
-
-    evaluation.context = {
-      messageCount: messages.length,
-      agentMessages: messages.filter(m => m.role === 'agent').length,
-      customerMessages: messages.filter(m => m.role === 'customer').length,
-      lateReplies: late_replies_count,
-      escalationChoice: escalation_choice
-    };
-
-    return res.json(evaluation);
-  } catch (error) {
-    console.error('Evaluation error:', error);
-    return res.status(500).json({
-      error: 'Evaluation failed',
-      details: error.message,
-      elements: Object.fromEntries(Object.keys(evaluationConfig.criteria).map(cat => [cat, { present: false, score: 0, feedback: 'Evaluation failed' }])),
-      penalties: { lateReplies: {count: 0, pointsDeducted: 0, feedback: ''}, wrongEscalation: {applied: false, pointsDeducted: 0, feedback: ''} },
-      totalScore: 0,
-      feedback: 'Evaluation system error. Try again.'
-    });
-  }
-});
-
-// Endpoint: Respond as customer (Unchanged, but refactored for clarity)
+// Endpoint: Respond as customer
 app.post('/api/respond', async (req, res) => {
-  const { agent_reply, history } = req.body;  // Simplified; assume scenario/kb not used
+  const { agent_reply, history } = req.body;
   if (!agent_reply) return res.status(400).json({ error: 'Missing agent_reply' });
 
-  if (!req.session.conversation) req.session.conversation = { uselessReplies: 0, isEnded: false };
+  if (!req.session.conversation) req.session.conversation = { uselessReplies: 0, agentReplyCount: 0, isEnded: false };
   if (req.session.conversation.isEnded) {
     return res.status(403).json({ error: 'Conversation ended', message: 'Issue escalated.' });
+  }
+
+  // Enforced server-side, not just in the client's send button — the client-side
+  // MAX_AGENT_REPLIES check can be bypassed by calling this endpoint directly, which
+  // previously left the "auto-termination at 10 replies" as a UI suggestion only.
+  req.session.conversation.agentReplyCount++;
+  if (req.session.conversation.agentReplyCount > 10) {
+    req.session.conversation.isEnded = true;
+    return res.status(403).json({ error: 'Conversation ended', message: 'Maximum reply limit reached. This case has been escalated to higher authorities.' });
   }
 
   const lower = agent_reply.toLowerCase();
@@ -345,56 +560,61 @@ ${history}`;
   const cacheKey = systemPrompt + userPrompt;
   if (cache.has(cacheKey)) return res.json({ reply: cache.get(cacheKey) });
 
-  const body = {
-    model: process.env.OPENROUTER_MODEL || 'mistralai/mistral-7b-instruct',
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt }
-    ],
-    max_tokens: 300,
-    temperature: 0.9
-  };
-
-  try {
-    const orRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body)
-    });
-
-    if (!orRes.ok) throw new Error(`OpenRouter error: ${await orRes.text()}`);
-
-    const json = await orRes.json();
-    let reply = json.choices?.[0]?.message?.content || '(No reply)';
-
-    if (!validateCustomerResponse(reply)) {
-      if (solutionProvided) reply = "Fine, I'll check my email again. This better work!";
-      else if (isProbing) reply = "YES, I already tried all that! Stop wasting time!";
-      else reply = "Unacceptable! Need access NOW!";
-    }
-
-    cache.set(cacheKey, reply);
-    res.json({ reply });
-  } catch (err) {
-    console.error('Server error:', err);
-    res.status(500).json({ error: err.message });
+  if (!consumeAiBudget(req)) {
+    return res.status(429).json({ error: 'Rate limit exceeded', message: `Limit of ${AI_RATE_LIMIT_PER_HOUR} AI-backed requests per hour reached. Please try again later.` });
   }
+
+  const result = AI_ENABLED
+    ? await callAI([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ], { maxTokens: 300, temperature: 0.9 })
+    : null;
+
+  let reply = result?.content?.trim() || '';
+
+  if (!validateCustomerResponse(reply)) {
+    if (solutionProvided) reply = "Fine, I'll check my email again. This better work!";
+    else if (isProbing) reply = "YES, I already tried all that! Stop wasting time!";
+    else reply = "Unacceptable! Need access NOW!";
+  }
+
+  cacheSet(cacheKey, reply);
+  res.json({ reply });
 });
 
-// New Endpoint: Close case (Handles escalation choice, but allows proceed; penalties applied in evaluate)
+// Endpoint: Close case
 app.post('/api/close', (req, res) => {
   const { escalation_choice } = req.body;
   if (!escalation_choice) return res.status(400).json({ error: 'Missing escalation_choice' });
 
-  // In this scenario, always allow proceed, but note choice for evaluation
   if (req.session.conversation) req.session.conversation.escalationChoice = escalation_choice;
 
   return res.json({ success: true, message: 'Case closed. Proceed to evaluation.' });
 });
 
+// Exposed because an exhausted quota, an unfunded key and a dead model all look
+// identical from outside otherwise: the customer just stops sounding like an AI.
+app.get('/healthz', (req, res) => {
+  res.json({
+    ok: true,
+    aiEnabled: AI_ENABLED,
+    aiProvider: AI_PROVIDER,
+    aiModels: AI_CHAIN.map(e => `${e.provider}:${e.model}`),
+    aiQuotaExhaustedUntil: Object.fromEntries(
+      [...aiCooldownUntil].map(([provider, until]) => [provider, new Date(until).toISOString()])
+    ),
+    aiBudget: {
+      limitPerHour: AI_RATE_LIMIT_PER_HOUR,
+      usedByYou: (aiUsage.get(req.ip) || {}).count || 0,
+      trackedClients: aiUsage.size
+    },
+    clientIp: req.ip,
+    cacheEntries: cache.size
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
+  console.log(`AI provider: ${AI_ENABLED ? AI_PROVIDER : 'disabled (no API key configured)'}`);
 });

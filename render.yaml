@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: k-store-email-simulator
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: AI_PROVIDER
+        value: deepseek
+      - key: AI_MODELS
+        value: ""
+      - key: AI_RATE_LIMIT_PER_HOUR
+        value: "40"
+      # Set these in the Render dashboard, not here.
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: HTTP_REFERER
+        sync: false

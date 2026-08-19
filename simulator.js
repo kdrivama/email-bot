@@ -215,18 +215,55 @@ document.addEventListener('DOMContentLoaded', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ messages: conversationHistory, late_replies_count: lateRepliesCount, escalation_choice: escalationNo.checked ? 'No' : 'Yes' })
     })
-    .then(response => response.json())
-    .then(data => {
+    .then(async response => {
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.evaluationFailed) {
+        // A system failure must never be shown as a scored 0/100 — the trainee has
+        // no way to tell "you failed" from "the grader broke" otherwise.
+        showEvaluationError(data.details || data.error || 'The evaluation service is unavailable.');
+        return;
+      }
       updateEvaluationPanel(data);
       const panel = document.getElementById('evaluation-panel');
       if (panel) panel.classList.remove('hidden');
-      // store latest evaluation for details
       window.__latestEvaluation = data;
     })
-    .catch(error => alert('Evaluation error: ' + error.message))
+    .catch(error => showEvaluationError(error.message))
     .finally(() => {
       if (loading) loading.style.display = 'none';
     });
+  }
+
+  function showEvaluationError(details) {
+    const panel = document.getElementById('evaluation-panel');
+    if (panel) panel.classList.remove('hidden');
+    const totalEl = document.getElementById('total-score');
+    if (totalEl) totalEl.textContent = '—';
+    const feedbackEl = document.getElementById('overall-feedback');
+    if (feedbackEl) {
+      feedbackEl.innerHTML = '';
+      const strong = document.createElement('strong');
+      strong.textContent = 'Evaluation unavailable — this is not your score. ';
+      const span = document.createElement('span');
+      span.textContent = details || 'Please try again.';
+      const retry = document.createElement('button');
+      retry.textContent = 'Retry evaluation';
+      retry.className = 'primary';
+      retry.style.marginTop = '10px';
+      retry.style.display = 'block';
+      retry.addEventListener('click', evaluateConversation);
+      feedbackEl.appendChild(strong);
+      feedbackEl.appendChild(span);
+      feedbackEl.appendChild(retry);
+    }
+    ['greeting', 'empathy', 'solution', 'closing'].forEach(k => {
+      const s = document.getElementById(`score-${k}`);
+      const d = document.getElementById(`desc-${k}`);
+      if (s) s.textContent = '—';
+      if (d) d.textContent = '';
+    });
+    const box = document.getElementById('deduction-box');
+    if (box) box.classList.add('hidden');
   }
 
   function showTerminationPopup(message) {
@@ -262,6 +299,20 @@ document.addEventListener('DOMContentLoaded', () => {
     const totalVal = (typeof data.adjustedTotalScore === 'number') ? data.adjustedTotalScore : data.totalScore;
     get('total-score').textContent = `${totalVal}/100`;
     get('overall-feedback').textContent = data.feedback || '';
+
+    // The server can zero every score for a critical violation (profanity, hostile
+    // or dismissive language); without this the trainee saw a 0/100 with no
+    // indication of why, indistinguishable from an ordinary weak reply.
+    const violationBox = get('violation-box');
+    if (violationBox) {
+      if (data.criticalViolation) {
+        violationBox.textContent = `Critical violation: ${data.violationDetails || 'unprofessional language detected'}. All scores set to 0.`;
+        violationBox.classList.remove('hidden');
+      } else {
+        violationBox.classList.add('hidden');
+        violationBox.textContent = '';
+      }
+    }
 
     // Deductions panel (only if applicable)
     const deductions = [];

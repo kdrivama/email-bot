@@ -1,6 +1,7 @@
 node_modules/
 .env
 .env.*
+!.env.example
 .DS_Store
 .vscode/
 npm-debug.log*
@@ -9,4 +10,3 @@ yarn-error.log*
 dist/
 coverage/
 *.log
-package-lock.json
